@@ -1,0 +1,9 @@
+{
+  "host": "smtp.yourorg.tld",
+  "port": 587,
+  "use_starttls": true,
+  "username": "smtp-service-account",
+  "password_env": "SMTP_PASSWORD",
+  "from_addr": "agdf-no-reply@army.ic.gov",
+  "reply_to": "helpdesk@yourorg.tld"
+}
