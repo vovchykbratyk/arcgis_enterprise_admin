@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """
-Name:           proxy_hosts.py
-Purpose:        Report external host references across an ArcGIS Enterprise instance
-Dependencies:   age-oauth, arcgis
-Outputs:        proxy_host_evidence.csv | allowed_proxy_hosts.json | proxy_host_scan_errors.csv
+proxy_hosts.py
+
+Purpose: Crawl an ArcGIS Enteprise instance (target 11.3 API) and build a list
+         of external hostnames referenced in services.  Add those to an array
+         for inclusion in allowedProxyHosts
+
+Dependencies: age-oauth, arcgis
+
+How to run (assuming Powershell): python .\proxy_hosts.py
+
+HIGHLY ADVISED to run this as a sysadmin, as the user should be able to see
+any and all items across the ArcGIS Enterprise instance.
+
+Outputs:
+    ./proxy-host-audit/allowed_proxy_hosts.json
+    ./proxy-host-audit/proxy_host_evidence.csv
 """
 
 from __future__ import annotations
@@ -14,30 +26,23 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
-import requests
 from age_oauth import get_gis
 from arcgis.gis import GIS, Item
 
 
-# global config
-CONNECTION = "deepskyagdf"  # age-oauth connection label
-
+# globals
+CONNECTION = "myportal"
 OUTPUT_DIRECTORY = Path("proxy-host-audit")
 
-# Trusted internal hosts
-# Can be explicit (subdomain.hostname.tld)
-# or implicit (.hostname.tld will ignore *.hostname.tld)
+# Hostnames or DNS patterns to ignore
 INTERNAL_HOSTS = {
-    ".gisa.public",
+    "agdf.army.ic.gov",
+    ".army.ic.gov",
 }
 
-REQUEST_TIMEOUT = 30
-VERIFY_EXTERNAL_TLS = False
-
-
-# data models
+# data object
 @dataclass(frozen=True)
 class Finding:
     hostname: str
@@ -49,30 +54,16 @@ class Finding:
     json_path: str
 
 
-@dataclass(frozen=True)
-class ScanError:
-    item_id: str
-    item_title: str
-    source: str
-    error: str
-
-
-# url slicing
+# regex for URL
 URL_PATTERN = re.compile(
     r"""https?://[^\s"'<>\\)\]}]+""",
-    flags=re.IGNORECASE,
-)
-
-ARCGIS_SERVICE_PATTERN = re.compile(
-    r"""^(?P<root>https?://.+?/(?:MapServer|FeatureServer|ImageServer))"""
-    r"""(?:/\d+)?/?(?:\?.*)?$""",
     flags=re.IGNORECASE,
 )
 
 
 def extract_urls(text: str) -> set[str]:
     """
-    Extract HTTP and HTTPS URLs from text
+    Extract HTTP and HTTPS URLs from text (HTML, popups, JSON, wherever)
     """
     urls: set[str] = set()
 
@@ -90,40 +81,14 @@ def extract_urls(text: str) -> set[str]:
         if not parsed.hostname:
             continue
 
-        urls.add(normalize_url(candidate))
+        urls.add(candidate)
 
     return urls
 
 
-def normalize_url(url: str) -> str:
-    """
-    Normalize url scheme and host
-    """
-    parsed = urlparse(url)
-
-    hostname = (parsed.hostname or "").lower().rstrip(".")
-    port = parsed.port
-
-    if port is None:
-        netloc = hostname
-    else:
-        netloc = f"{hostname}:{port}"
-
-    return urlunparse(
-        (
-            parsed.scheme.lower(),
-            netloc,
-            parsed.path,
-            parsed.params,
-            parsed.query,
-            "",
-        )
-    )
-
-
 def hostname_from_url(url: str) -> str | None:
     """
-    Return a lowercase hostname, drop port info if needed
+    Return a normalized destination hostname
     """
     try:
         hostname = urlparse(url).hostname
@@ -136,23 +101,9 @@ def hostname_from_url(url: str) -> str | None:
     return hostname.lower().rstrip(".")
 
 
-def arcgis_service_root(url: str) -> str | None:
-    """
-    Convert ArcGIS service URL to its service root
-
-    e.g. ../MapServer/0 to /MapServer
-    """
-    match = ARCGIS_SERVICE_PATTERN.match(url.rstrip("/"))
-
-    if not match:
-        return None
-
-    return match.group("root").rstrip("/")
-
-
 def host_is_internal(hostname: str, internal_hosts: set[str]) -> bool:
     """
-    Check hostnames and DNS suffix rules
+    Check if hostname is internal and thus ignored
     """
     hostname = hostname.lower().rstrip(".")
 
@@ -171,10 +122,9 @@ def host_is_internal(hostname: str, internal_hosts: set[str]) -> bool:
     return False
 
 
-# inspect json
 def walk_json(value: Any, path: str = "$") -> Iterator[tuple[str, str]]:
     """
-    Yield JSON path and URL for every URL found recursively
+    generator producing each URL and JSON path
     """
     if isinstance(value, dict):
         for key, child in value.items():
@@ -189,30 +139,55 @@ def walk_json(value: Any, path: str = "$") -> Iterator[tuple[str, str]]:
             yield path, url
 
 
+# inspection jobs
+def all_organization_items(gis: GIS) -> list[Item]:
+    """
+    Returns all items visible to the authenticated user - this
+    is why we run it as SA
+    """
+    organization_id = gis.properties.id
+
+    return gis.content.search(
+        query=f"orgid:{organization_id}",
+        max_items=-1,
+        outside_org=False,
+    )
+
+
+def item_properties(item: Item) -> dict[str, Any]:
+    """
+    Convert item metadata to dict
+    """
+    try:
+        return dict(item)
+    except (TypeError, ValueError):
+        return {
+            "id": item.id,
+            "title": item.title,
+            "type": item.type,
+            "url": getattr(item, "url", None),
+            "description": getattr(item, "description", None),
+            "snippet": getattr(item, "snippet", None),
+            "typeKeywords": getattr(item, "typeKeywords", None),
+        }
+
+
 def inspect_document(
     document: Any,
+    *,
     item: Item,
     source: str,
     internal_hosts: set[str],
     findings: set[Finding],
-) -> set[str]:
+) -> None:
     """
-    Inspect an arbitrary JSON-compatible document,
-    return any ArcGIS REST service roots found in the doc so
-    service and layer definitions can be inspected separately.
+    Extract external URL references from item doc
     """
-    discovered_services: set[str] = set()
-
     for json_path, url in walk_json(document):
         hostname = hostname_from_url(url)
 
         if not hostname:
             continue
-
-        service_root = arcgis_service_root(url)
-
-        if service_root:
-            discovered_services.add(service_root)
 
         if host_is_internal(hostname, internal_hosts):
             continue
@@ -229,186 +204,23 @@ def inspect_document(
             )
         )
 
-    return discovered_services
-
-
-# Portal interrogation
-def all_organization_items(gis: GIS) -> list[Item]:
-    """
-    Return organization content visible to the authenticated user (should be run as admin)
-    """
-    organization_id = gis.properties.id
-
-    return gis.content.search(
-        query=f"orgid:{organization_id}",
-        max_items=-1,
-        outside_org=False,
-    )
-
-
-def item_properties(item: Item) -> dict[str, Any]:
-    """
-    Convert ArcGIS API Item to dict
-    """
-    try:
-        return dict(item)
-    except (TypeError, ValueError):
-        return {
-            "id": item.id,
-            "title": item.title,
-            "type": item.type,
-            "url": getattr(item, "url", None),
-            "description": getattr(item, "description", None),
-            "snippet": getattr(item, "snippet", None),
-            "typeKeywords": getattr(item, "typeKeywords", None),
-        }
-
-
-def request_arcgis_json(
-    session: requests.Session,
-    url: str,
-    token: str | None,
-) -> dict[str, Any]:
-    """
-    Read ArcGIS REST resource as JSON
-    """
-    params = {"f": "json"}
-
-    if token:
-        params["token"] = token
-
-    response = session.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-        verify=VERIFY_EXTERNAL_TLS,
-    )
-    response.raise_for_status()
-
-    payload = response.json()
-
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected a JSON object from {url}")
-
-    if "error" in payload:
-        error = payload["error"]
-
-        raise RuntimeError(
-            f"ArcGIS REST error {error.get('code')}: "
-            f"{error.get('message')}; "
-            f"{error.get('details', [])}"
-        )
-
-    return payload
-
-
-def inspect_arcgis_service(
-    service_url: str,
-    item: Item,
-    session: requests.Session,
-    portal_token: str | None,
-    internal_hosts: set[str],
-    findings: set[Finding],
-    errors: list[ScanError],
-    scanned_services: set[str],
-) -> None:
-    """
-    Inspect ArcGIS service root and advertised layers/tables
-    """
-    service_url = service_url.rstrip("/")
-
-    if service_url in scanned_services:
-        return
-
-    scanned_services.add(service_url)
-
-    try:
-        service_definition = request_arcgis_json(
-            session=session,
-            url=service_url,
-            token=portal_token,
-        )
-    except Exception as exc:
-        errors.append(
-            ScanError(
-                item_id=item.id,
-                item_title=item.title or "",
-                source=service_url,
-                error=str(exc),
-            )
-        )
-        return
-
-    inspect_document(
-        document=service_definition,
-        item=item,
-        source=f"service-definition:{service_url}",
-        internal_hosts=internal_hosts,
-        findings=findings,
-    )
-
-    for collection_name in ("layers", "tables"):
-        entries = service_definition.get(collection_name, [])
-
-        if not isinstance(entries, list):
-            continue
-
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-
-            resource_id = entry.get("id")
-
-            if resource_id is None:
-                continue
-
-            resource_url = f"{service_url}/{resource_id}"
-
-            try:
-                resource_definition = request_arcgis_json(
-                    session=session,
-                    url=resource_url,
-                    token=portal_token,
-                )
-
-                inspect_document(
-                    document=resource_definition,
-                    item=item,
-                    source=f"{collection_name[:-1]}-definition:{resource_url}",
-                    internal_hosts=internal_hosts,
-                    findings=findings,
-                )
-
-            except Exception as exc:
-                errors.append(
-                    ScanError(
-                        item_id=item.id,
-                        item_title=item.title or "",
-                        source=resource_url,
-                        error=str(exc),
-                    )
-                )
-
 
 # outputs
-def write_outputs(
-    findings: set[Finding],
-    errors: list[ScanError],
-) -> None:
+def write_outputs(findings: set[Finding]) -> None:
     """
-    write evidence, candidate host config and errors
+    write a preliminary allowlist and supporting data
     """
     OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
     evidence_file = OUTPUT_DIRECTORY / "proxy_host_evidence.csv"
     hosts_file = OUTPUT_DIRECTORY / "allowed_proxy_hosts.json"
-    errors_file = OUTPUT_DIRECTORY / "proxy_host_scan_errors.csv"
 
     sorted_findings = sorted(
         findings,
         key=lambda finding: (
             finding.hostname,
             finding.item_title.casefold(),
+            finding.item_id,
             finding.source,
             finding.json_path,
             finding.url,
@@ -435,33 +247,20 @@ def write_outputs(
 
     with hosts_file.open("w", encoding="utf-8") as handle:
         json.dump(
-            {"allowedProxyHosts": hostnames},
+            {
+                "allowedProxyHosts": hostnames,
+            },
             handle,
             indent=2,
         )
         handle.write("\n")
 
-    with errors_file.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "item_id",
-                "item_title",
-                "source",
-                "error",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(asdict(error) for error in errors)
-
     print()
     print(f"Distinct external hosts: {len(hostnames)}")
     print(f"Evidence records:        {len(sorted_findings)}")
-    print(f"Scan errors:             {len(errors)}")
     print()
-    print(f"Evidence: {evidence_file}")
-    print(f"Hosts:    {hosts_file}")
-    print(f"Errors:   {errors_file}")
+    print(f"Allowed hosts: {hosts_file}")
+    print(f"Evidence:      {evidence_file}")
 
 
 # main function
@@ -470,12 +269,13 @@ def main() -> int:
 
     gis = get_gis(connection=CONNECTION)
 
-    username = gis.users.me.username
     portal_url = gis.url.rstrip("/")
     portal_host = hostname_from_url(portal_url)
+    username = gis.users.me.username
 
     internal_hosts = set(INTERNAL_HOSTS)
 
+    # Always exclude the Portal's own hostname.
     if portal_host:
         internal_hosts.add(portal_host)
 
@@ -488,69 +288,43 @@ def main() -> int:
     print(f"Found {len(items)} items.")
 
     findings: set[Finding] = set()
-    errors: list[ScanError] = []
-    scanned_services: set[str] = set()
-    session = requests.Session()
-
-    # age-oauth supplied the GIS and maintains access token lifecycle
-    # Current token is reused for secured federated REST requests
-    portal_token = getattr(gis._con, "token", None)
 
     for item_number, item in enumerate(items, start=1):
         if item_number == 1 or item_number % 100 == 0:
             print(f"Scanning item {item_number} of {len(items)}...")
 
-        service_urls = inspect_document(
-            document=item_properties(item),
+        # Top-level properties include service item URLs, homepage URLs,
+        # documentation references, descriptions, and other metadata.
+        inspect_document(
+            item_properties(item),
             item=item,
             source="item-properties",
             internal_hosts=internal_hosts,
             findings=findings,
         )
 
+        # Item data contains Web Map operational layers, basemaps, tables,
+        # app configurations, Web Scenes, dashboards, StoryMaps, and similar
+        # JSON documents.
         try:
             data = item.get_data(try_json=True)
-
-            if data is not None:
-                service_urls |= inspect_document(
-                    document=data,
-                    item=item,
-                    source="item-data",
-                    internal_hosts=internal_hosts,
-                    findings=findings,
-                )
-
         except Exception as exc:
-            errors.append(
-                ScanError(
-                    item_id=item.id,
-                    item_title=item.title or "",
-                    source="item-data",
-                    error=str(exc),
-                )
+            print(
+                f"Warning: could not read item data for "
+                f"{item.id} ({item.title}): {exc}"
             )
+            continue
 
-        item_url = getattr(item, "url", None)
-
-        if isinstance(item_url, str):
-            root = arcgis_service_root(item_url)
-
-            if root:
-                service_urls.add(root)
-
-        for service_url in sorted(service_urls):
-            inspect_arcgis_service(
-                service_url=service_url,
+        if data is not None:
+            inspect_document(
+                data,
                 item=item,
-                session=session,
-                portal_token=portal_token,
+                source="item-data",
                 internal_hosts=internal_hosts,
                 findings=findings,
-                errors=errors,
-                scanned_services=scanned_services,
             )
 
-    write_outputs(findings, errors)
+    write_outputs(findings)
     return 0
 
 
